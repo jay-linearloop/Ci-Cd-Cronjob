@@ -1,0 +1,84 @@
+name: Terraform Cloud Destroy with Retry
+
+on:
+  # schedule:
+  #   - cron: '30 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      - name: Upload Configuration
+        uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.0.0
+        id: upload
+        with:
+          workspace: "${{ secrets.WORKSPACE_NAME }}"
+          directory: "."
+        env:
+          TF_CLOUD_ORGANIZATION: "${{ secrets.ORG_NAME }}"
+          TF_API_TOKEN: "${{ secrets.TERRAFORM_API_TOKEN }}"
+
+      - name: Trigger Destroy Run
+        id: destroy
+        run: |
+          curl \
+            --header "Authorization: Bearer ${{ secrets.TERRAFORM_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            --request POST \
+            --data '{
+              "data": {
+                "attributes": {
+                  "is-destroy": true,
+                  "message": "Destroying infrastructure via GitHub Actions"
+                },
+                "type": "runs",
+                "relationships": {
+                  "workspace": {
+                    "data": {
+                      "type": "workspaces",
+                      "id": "${{ secrets.WORKSPACE_ID }}"
+                    }
+                  }
+                }
+              }
+            }' \
+            https://app.terraform.io/api/v2/runs \
+            --silent --show-error --fail --output response.json
+
+      - name: Extract run_id
+        id: extract_run_id
+        run: |
+          run_id=$(jq -r '.data.id' response.json)
+          echo "::set-output name=destroy_run_id::$run_id"
+
+      # Retry destroy confirmation
+      - name: Retry Approve Destroy Plan if Failed
+        run: |
+          attempts=0
+          max_attempts=3
+          while [ $attempts -lt $max_attempts ]; do
+            curl \
+              --header "Authorization: Bearer ${{ secrets.TERRAFORM_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              --request POST \
+              --data '{
+                "data": {
+                  "type": "runs",
+                  "attributes": {
+                    "status": "confirmed"
+                  }
+                }
+              }' \
+              https://app.terraform.io/api/v2/runs/${{ steps.extract_run_id.outputs.destroy_run_id }}/actions/confirm && break
+            attempts=$((attempts+1))
+            sleep 10
+          done
+        env:
+          TF_API_TOKEN: "${{ secrets.TERRAFORM_API_TOKEN }}"
